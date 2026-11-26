@@ -1,4 +1,4 @@
-name: Download YouTube (No Cookies)
+name: Download YouTube (No Cookies, Fixed)
 
 on:
   workflow_dispatch:
@@ -11,30 +11,33 @@ on:
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install yt-dlp and curl-cffi
+      # ① JavaScriptランタイム (Deno) をインストール
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install yt-dlp + EJS solver
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade yt-dlp curl-cffi
+          pip install --upgrade yt-dlp curl-cffi yt-dlp-ejs
 
-      # 1. PO TokenプロバイダーをDockerで起動
       - name: Start PO Token Provider (bgutil)
         run: |
           docker run -d --name bgutil-provider --init \
             -p 127.0.0.1:4416:4416 \
             brainicism/bgutil-ytdlp-pot-provider
 
-      # 2. Cloudflare WARPをセットアップし、SOCKS5プロキシとして起動
       - name: Setup Cloudflare WARP proxy
         run: |
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -46,17 +49,23 @@ jobs:
           warp-cli --accept-tos connect
           sleep 5
 
-      # 3. ダウンロード実行（PO Token + WARPプロキシ + クライアント偽装）
-      - name: Download video
-        run: |
-          yt-dlp \
-            --impersonate chrome \
-            --extractor-args "youtube:player_client=tv,mweb,web" \
-            --proxy "socks5://127.0.0.1:40000" \
-            --sleep-interval 5 \
-            --max-filesize 500M \
-            -o "%(title)s.%(ext)s" \
-            "${{ github.event.inputs.video_url }}"
+      # ② リトライ付きダウンロード（"page needs to be reloaded" 対策）
+      - name: Download video (with retry)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: |
+            yt-dlp \
+              --impersonate chrome \
+              --extractor-args "youtube:player_client=default,-tv,-web_embedded" \
+              --remote-components ejs:github \
+              --proxy "socks5://127.0.0.1:40000" \
+              --sleep-interval 5 \
+              --max-filesize 500M \
+              -o "%(title)s.%(ext)s" \
+              "${{ github.event.inputs.video_url }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
