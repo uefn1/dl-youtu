@@ -31,7 +31,7 @@ jobs:
         with:
           deno-version: v2.x
 
-      # ② ffmpeg（マージ・リマックス・TS分割に必須。ランナーには未インストール）
+      # ② ffmpeg（マージ・リマックス・MKV分割に必須。ランナーには未インストール）
       - name: Install ffmpeg
         run: |
           sudo apt-get update
@@ -85,8 +85,8 @@ jobs:
               -o "%(title)s.%(ext)s" \
               "${{ github.event.inputs.video_url }}"
 
-      # ⑥ 1.9GiB以上の動画を時間ベースでTS分割
-      - name: Split oversized videos into TS segments (time-based)
+      # ⑥ 1.9GiB以上の動画を時間ベースでMKV分割（再エンコードなし）
+      - name: Split oversized videos into MKV segments (time-based)
         id: split
         run: |
           shopt -s nullglob
@@ -113,16 +113,16 @@ jobs:
             SEG_TIME=$(awk -v d="$DURATION" -v s="$SIZE" -v t="$TARGET" \
               'BEGIN { st = d * (t / s); if (st < 10) st = 10; printf "%.2f", st }')
 
-            echo "Splitting $INPUT (duration=${DURATION}s) into TS segments of ~${SEG_TIME}s each..."
+            echo "Splitting $INPUT (duration=${DURATION}s) into MKV segments of ~${SEG_TIME}s each..."
 
             ffmpeg -hide_banner -loglevel info \
               -i "$INPUT" \
               -c copy \
               -f segment \
-              -segment_format mpegts \
+              -segment_format matroska \
               -segment_time "$SEG_TIME" \
               -reset_timestamps 1 \
-              "${INPUT%.*}_part_%03d.ts"
+              "${INPUT%.*}_part_%03d.mkv"
 
             rm -f "$INPUT"
             SPLIT_ANY=true
@@ -140,12 +140,11 @@ jobs:
           body: |
             Source: ${{ github.event.inputs.video_url }}
             Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            Split into TS segments: ${{ steps.split.outputs.SPLIT }}
+            Split into MKV segments: ${{ steps.split.outputs.SPLIT }}
           files: |
-            *.ts
+            *.mkv
             *.mp4
             *.webm
-            *.mkv
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
