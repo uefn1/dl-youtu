@@ -9,7 +9,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: write   # Release作成・アセットアップロードに必須
 
 jobs:
   download:
@@ -17,29 +17,41 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
+      # ① JavaScriptランタイム (Deno) — n challenge / EJS 解決に必須
       - name: Setup Deno
         uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
+
+      # ② ffmpeg（マージ・リマックス・TS分割に必須。ランナーには未インストール）
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+          ffprobe -version
 
       - name: Install yt-dlp + EJS solver
         run: |
           python -m pip install --upgrade pip
           pip install --upgrade yt-dlp curl-cffi yt-dlp-ejs
 
+      # ③ PO Tokenプロバイダー（Docker）
       - name: Start PO Token Provider (bgutil)
         run: |
           docker run -d --name bgutil-provider --init \
             -p 127.0.0.1:4416:4416 \
             brainicism/bgutil-ytdlp-pot-provider
 
+      # ④ Cloudflare WARPをSOCKS5プロキシとして起動
       - name: Setup Cloudflare WARP proxy
         run: |
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
@@ -52,14 +64,8 @@ jobs:
           warp-cli --accept-tos proxy port 40000
           warp-cli --accept-tos connect
           sleep 5
-          
-      - name: Install ffmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          ffmpeg -version
-          
-      # ① ダウンロード（bestquality、MP4にリマックス、マージ失敗時は個別ファイルを残さない）
+
+      # ⑤ ダウンロード（bestquality・サイズ制限なし・リトライ付き）
       - name: Download video (best quality, remux to mp4)
         uses: nick-fields/retry@v3
         with:
@@ -79,42 +85,53 @@ jobs:
               -o "%(title)s.%(ext)s" \
               "${{ github.event.inputs.video_url }}"
 
-      # ② 全動画ファイルをループし、1.9GiB以上のものをTS分割
-      - name: Split oversized videos into TS segments
+      # ⑥ 1.9GiB以上の動画を時間ベースでTS分割
+      - name: Split oversized videos into TS segments (time-based)
         id: split
         run: |
           shopt -s nullglob
-          LIMIT=$((1900 * 1024 * 1024))   # 約1.9GiB
+          LIMIT=$((1900 * 1024 * 1024))      # 約1.9GiB（分割要否のしきい値）
+          TARGET=$((1700 * 1024 * 1024))     # 1セグメントの目標サイズ（1.7GiB、安全マージン）
           SPLIT_ANY=false
 
           for INPUT in *.mp4 *.webm *.mkv; do
             [ -f "$INPUT" ] || continue
             SIZE=$(stat -c%s "$INPUT")
-            echo "Checking: $INPUT ($SIZE bytes, limit=$LIMIT)"
+            echo "Checking: $INPUT ($SIZE bytes)"
 
-            if [ "$SIZE" -ge "$LIMIT" ]; then
-              echo "Splitting $INPUT into TS segments..."
-              ffmpeg -hide_banner -loglevel info \
-                -i "$INPUT" \
-                -c copy \
-                -f segment \
-                -segment_format mpegts \
-                -segment_size 1800M \
-                -reset_timestamps 1 \
-                -segment_list "${INPUT%.*}_segments.csv" \
-                "${INPUT%.*}_part_%03d.ts"
-
-              rm -f "$INPUT"
-              SPLIT_ANY=true
-            else
+            if [ "$SIZE" -lt "$LIMIT" ]; then
               echo "$INPUT is under 1.9GiB; keeping as-is."
+              continue
             fi
+
+            # 動画の長さ（秒）を取得
+            DURATION=$(ffprobe -v error \
+              -show_entries format=duration \
+              -of default=noprint_wrappers=1:nokey=1 "$INPUT")
+
+            # 目標サイズに収まるセグメント秒数を計算（最低10秒）
+            SEG_TIME=$(awk -v d="$DURATION" -v s="$SIZE" -v t="$TARGET" \
+              'BEGIN { st = d * (t / s); if (st < 10) st = 10; printf "%.2f", st }')
+
+            echo "Splitting $INPUT (duration=${DURATION}s) into TS segments of ~${SEG_TIME}s each..."
+
+            ffmpeg -hide_banner -loglevel info \
+              -i "$INPUT" \
+              -c copy \
+              -f segment \
+              -segment_format mpegts \
+              -segment_time "$SEG_TIME" \
+              -reset_timestamps 1 \
+              "${INPUT%.*}_part_%03d.ts"
+
+            rm -f "$INPUT"
+            SPLIT_ANY=true
           done
 
           echo "SPLIT=$SPLIT_ANY" >> $GITHUB_OUTPUT
           ls -lh
 
-      # ③ Releaseアップロード（TSと元動画の両方を対象に）
+      # ⑦ GitHub Releaseへアップロード
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
