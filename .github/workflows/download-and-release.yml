@@ -9,23 +9,21 @@ on:
         type: string
 
 permissions:
-  contents: write   # Release作成・アセットアップロードに必須
+  contents: write
 
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # ① JavaScriptランタイム (Deno) — n challenge / EJS 解決に必須
       - name: Setup Deno
         uses: denoland/setup-deno@v2
         with:
@@ -36,14 +34,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade yt-dlp curl-cffi yt-dlp-ejs
 
-      # ② PO Tokenプロバイダー（Docker）
       - name: Start PO Token Provider (bgutil)
         run: |
           docker run -d --name bgutil-provider --init \
             -p 127.0.0.1:4416:4416 \
             brainicism/bgutil-ytdlp-pot-provider
 
-      # ③ Cloudflare WARPをSOCKS5プロキシとして起動
       - name: Setup Cloudflare WARP proxy
         run: |
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
@@ -57,11 +53,11 @@ jobs:
           warp-cli --accept-tos connect
           sleep 5
 
-      # ④ ダウンロード（bestquality・サイズ制限なし・リトライ付き）
-      - name: Download video (best quality, no size limit, with retry)
+      # ① ダウンロード（bestquality、MP4にリマックス、マージ失敗時は個別ファイルを残さない）
+      - name: Download video (best quality, remux to mp4)
         uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 40
+          timeout_minutes: 45
           max_attempts: 3
           retry_wait_seconds: 30
           command: |
@@ -73,48 +69,46 @@ jobs:
               --sleep-interval 5 \
               -f "bestvideo+bestaudio/best" \
               --merge-output-format mp4 \
+              --remux-video mp4 \
               -o "%(title)s.%(ext)s" \
               "${{ github.event.inputs.video_url }}"
 
-      # ⑤ 1.9GiB以上ならTS形式でサイズベース分割
-      - name: Split oversized video into TS segments
+      # ② 全動画ファイルをループし、1.9GiB以上のものをTS分割
+      - name: Split oversized videos into TS segments
         id: split
         run: |
           shopt -s nullglob
-          FILES=(*.mp4 *.webm *.mkv)
-          if [ ${#FILES[@]} -eq 0 ]; then
-            echo "No video file found." >&2
-            exit 1
-          fi
-
-          INPUT="${FILES[0]}"
-          SIZE=$(stat -c%s "$INPUT")
           LIMIT=$((1900 * 1024 * 1024))   # 約1.9GiB
+          SPLIT_ANY=false
 
-          echo "Input: $INPUT ($SIZE bytes, limit=$LIMIT)"
+          for INPUT in *.mp4 *.webm *.mkv; do
+            [ -f "$INPUT" ] || continue
+            SIZE=$(stat -c%s "$INPUT")
+            echo "Checking: $INPUT ($SIZE bytes, limit=$LIMIT)"
 
-          if [ "$SIZE" -ge "$LIMIT" ]; then
-            echo "Splitting into TS segments..."
-            ffmpeg -hide_banner -loglevel info \
-              -i "$INPUT" \
-              -c copy \
-              -f segment \
-              -segment_format mpegts \
-              -segment_size 1800M \
-              -reset_timestamps 1 \
-              -segment_list "segments.csv" \
-              "part_%03d.ts"
+            if [ "$SIZE" -ge "$LIMIT" ]; then
+              echo "Splitting $INPUT into TS segments..."
+              ffmpeg -hide_banner -loglevel info \
+                -i "$INPUT" \
+                -c copy \
+                -f segment \
+                -segment_format mpegts \
+                -segment_size 1800M \
+                -reset_timestamps 1 \
+                -segment_list "${INPUT%.*}_segments.csv" \
+                "${INPUT%.*}_part_%03d.ts"
 
-            rm -f "$INPUT"
-            echo "SPLIT=true" >> $GITHUB_OUTPUT
-          else
-            echo "File is under 1.9GiB; uploading as-is."
-            echo "SPLIT=false" >> $GITHUB_OUTPUT
-          fi
+              rm -f "$INPUT"
+              SPLIT_ANY=true
+            else
+              echo "$INPUT is under 1.9GiB; keeping as-is."
+            fi
+          done
 
+          echo "SPLIT=$SPLIT_ANY" >> $GITHUB_OUTPUT
           ls -lh
 
-      # ⑥ GitHub Releaseへアップロード
+      # ③ Releaseアップロード（TSと元動画の両方を対象に）
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
