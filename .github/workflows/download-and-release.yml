@@ -52,7 +52,13 @@ jobs:
           warp-cli --accept-tos proxy port 40000
           warp-cli --accept-tos connect
           sleep 5
-
+          
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+          
       # ① ダウンロード（bestquality、MP4にリマックス、マージ失敗時は個別ファイルを残さない）
       - name: Download video (best quality, remux to mp4)
         uses: nick-fields/retry@v3
