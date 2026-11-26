@@ -1,4 +1,4 @@
-name: Download YouTube (No Cookies, Fixed)
+name: Download YouTube & Release
 
 on:
   workflow_dispatch:
@@ -8,10 +8,13 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: write   # Release作成・アップロードに必須
+
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -21,7 +24,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      # ① JavaScriptランタイム (Deno) をインストール
       - name: Setup Deno
         uses: denoland/setup-deno@v2
         with:
@@ -49,7 +51,6 @@ jobs:
           warp-cli --accept-tos connect
           sleep 5
 
-      # ② リトライ付きダウンロード（"page needs to be reloaded" 対策）
       - name: Download video (with retry)
         uses: nick-fields/retry@v3
         with:
@@ -67,12 +68,58 @@ jobs:
               -o "%(title)s.%(ext)s" \
               "${{ github.event.inputs.video_url }}"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      # 1.9GiB以上ならTS分割、未満ならそのまま
+      - name: Split oversized video into TS segments
+        id: split
+        run: |
+          shopt -s nullglob
+          FILES=(*.mp4 *.webm *.mkv)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No video file found." >&2
+            exit 1
+          fi
+
+          INPUT="${FILES[0]}"
+          SIZE=$(stat -c%s "$INPUT")
+          LIMIT=$((1900 * 1024 * 1024))   # 1.9GiB弱（安全マージン込み）
+
+          echo "Input: $INPUT ($SIZE bytes)"
+
+          if [ "$SIZE" -ge "$LIMIT" ]; then
+            echo "Splitting into TS segments..."
+            # サイズベース分割。1セグメントあたり約1.8GiB以下に収める
+            ffmpeg -hide_banner -loglevel error \
+              -i "$INPUT" \
+              -c copy \
+              -f segment \
+              -segment_format mpegts \
+              -segment_size 1800M \
+              -reset_timestamps 1 \
+              -segment_list "segments.csv" \
+              "part_%03d.ts"
+
+            rm -f "$INPUT"
+            echo "SPLIT=true" >> $GITHUB_OUTPUT
+          else
+            echo "File is under 1.9GiB; uploading as-is."
+            echo "SPLIT=false" >> $GITHUB_OUTPUT
+          fi
+
+          ls -lh
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: downloaded-video
-          path: |
+          tag_name: download-${{ github.run_id }}
+          name: "YouTube Download ${{ github.run_id }}"
+          body: |
+            Source: ${{ github.event.inputs.video_url }}
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          files: |
+            *.ts
             *.mp4
             *.webm
             *.mkv
-          if-no-files-found: warn
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
